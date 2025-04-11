@@ -1,8 +1,7 @@
 import { createClient } from '@supabase/supabase-js'
 import express from 'express'
 import http from 'http'
-import { WebSocketServer, WebSocket } from 'ws'
-import jwt from 'jsonwebtoken'
+import { WebSocket, WebSocketServer } from 'ws'
 
 //todo: Add supabase - Connect user etc
 
@@ -15,7 +14,41 @@ const supabase = createClient(supabaseUrl, supabaseServiceKey)
 
 const PORT = 8000
 
-let clients = new Map() // Store clients with unique IDs
+let clients: Map<string, Map<string, WebSocket>> = new Map()
+// map<CHANNEL/COLLAB_ID>, map<USERID, WEBSOCKET>>
+
+function isChannel(channel: string) {
+  return clients.has(channel)
+}
+
+function isUserInChannel(channel: string, user: string) {
+  return clients[channel]?.has(user) ?? false
+}
+
+function joinChannel(channel: string, user: string, ws: WebSocket) {
+  if (!isUserInChannel(channel, user)) {
+    if (!clients.has(channel)) {
+      clients.set(channel, new Map())
+    }
+
+    clients.get(channel).set(user, ws)
+  }
+}
+
+function leaveChannel(channel: string, user: string) {
+  if (!isChannel(channel)) return
+  const users = clients[channel]
+
+  if (users?.size === 1 && isUserInChannel(channel, user)) {
+    users[user].close()
+    return clients.delete(channel)
+  }
+
+  if (isUserInChannel(channel, user)) {
+    users[user].close()
+    return users.delete(user)
+  }
+}
 
 app.use(express.static('public'))
 
@@ -30,44 +63,29 @@ async function createSupa(token: string) {
 }
 
 wss.on('connection', (ws, req) => {
-  //? Get connecting users username/id and save it to memory with new socket
   const params = new URLSearchParams(req.url.split('?')[1])
-  const remoteClient = params.get("user")
-  console.log(
-    'Clients:',
-    Array.from(clients).map((value) => value[0])
-  )
-  // let remoteClient: string
-  // let collab_id: string
-  /*   if (clients.size) {
-    ws.send(
-      JSON.stringify({
-        remoteClient,
-        message: {
-          type: 'connected',
-          currentUsers: Array.from(clients.keys()),
-        },
-      })
-    )
+  const user = params.get('user')
+  const channel = params.get('channel')
+  if (!user || !channel) {
+    console.error('Params missing, user:', user, 'channel:', channel)
+    ws.close()
   }
-  
-  console.log(`New client connected: ${remoteClient}`) */
 
-  console.log(remoteClient, "connected")
-  clients.set(remoteClient, ws)
-  
+  console.log(clients[channel])
+
   ws.on('message', async (message) => {
     const parsedMsg = JSON.parse(message.toString())
-    // console.log("🚀 ~ ws.on ~ parsedMsg:", parsedMsg)
+
+    //? Connect user and add to channel
     if (parsedMsg?.type === 'connect') {
+      console.log(user, 'connected')
+      joinChannel(channel, user, ws)
       // todo: check connection time etc, avoid permanent connection
-      const collab_id = parsedMsg.connect.collab_id
-      const {
-        data: { user },
-        error,
-      } = await supabase.auth.getUser(parsedMsg.connect.token)
+      const { data, error } = await supabase.auth.getUser(
+        parsedMsg.connect.token
+      )
       if (error) {
-        ws.terminate()
+        ws.close()
         throw new Error('Authentication error', error)
       }
       const supaclient = await createSupa(parsedMsg.connect.token)
@@ -75,20 +93,39 @@ wss.on('connection', (ws, req) => {
       const { error: userError } = await supaclient
         .from('collab_users')
         .update({ connection_status: 'connected' })
-        .match({ collab_id: collab_id, user_id: user.id })
+        .match({ collab_id: channel, user_id: data.user.id })
 
       if (userError) {
         throw new Error('Error connecting user to collab', userError)
+      }
+
+      //? Notify user that they've been connected
+      ws.send(
+        JSON.stringify({
+          message: {
+            type: 'connected',
+          },
+        })
+      )
+
+      // Tell everyone the user connected to the channel
+      const users = clients.get(channel)
+      const msg = { remoteClient: user, message: { type: 'connect' } }
+      if (users) {
+        users.forEach((client: WebSocket) => {
+          if (client !== ws && client.readyState === WebSocket.OPEN) {
+            client.send(JSON.stringify(msg))
+          }
+        })
       }
 
       return
     }
 
     if (parsedMsg?.type === 'disconnect') {
-      const {
-        data: { user },
-        error,
-      } = await supabase.auth.getUser(parsedMsg.disconnect.token)
+      const { data, error } = await supabase.auth.getUser(
+        parsedMsg.disconnect.token
+      )
 
       if (error) {
         throw new Error('Authentication error', error)
@@ -98,22 +135,37 @@ wss.on('connection', (ws, req) => {
       const { error: userError } = await supaclient
         .from('collab_users')
         .update({ connection_status: 'disconnected' })
-        .match({ collab_id: parsedMsg.connect.collab_id, user_id: user.id })
+        .match({ collab_id: channel, user_id: data.user.id })
 
       if (userError) {
         throw new Error('Error disconnecting client:', userError)
       }
+
+      // Tell everyone the user disconnected from the channel
+      const users = clients.get(channel)
+      const msg = { remoteClient: user, message: { type: 'disconnect' } }
+      if (users) {
+        users.forEach((client: WebSocket) => {
+          if (client !== ws && client.readyState === WebSocket.OPEN) {
+            client.send(JSON.stringify(msg))
+          }
+        })
+      }
+
+      return
     }
 
-    if (message) {
-      clients.forEach((client) => {
-        if (client !== ws && client.readyState === WebSocket.OPEN) {
-          //? Pass socket owner along with message
-          client.send(
-            `{"remoteClient":"${remoteClient}","message":${message.toString()}}`
-          )
-        }
-      })
+    if (message && isChannel(channel)) {
+      const users = clients.get(channel)
+      if (users) {
+        users.forEach((client: WebSocket) => {
+          if (client !== ws && client.readyState === WebSocket.OPEN) {
+            client.send(
+              `{"remoteClient":"${user}","message":${message.toString()}}`
+            )
+          }
+        })
+      }
     }
   })
 
@@ -121,24 +173,9 @@ wss.on('connection', (ws, req) => {
     console.error('error:', error)
   })
 
-  ws.on('close', async () => {
-    /*   clients.forEach((client) => {
-      if (client !== ws && client.readyState === WebSocket.OPEN) {
-        //? Pass socket owner along with message
-           const msg = {
-          remoteClient: remoteClient,
-          message: {
-            type: 'disconnect',
-            disconnect: {
-              user: remoteClient,
-            },
-          },
-        }
-        client.send(JSON.stringify(msg)) 
-      }
-    }) */
-    clients.delete(ws) //? Remove current client from memory
-    console.log(remoteClient, "disconnected")
+  ws.on('close', () => {
+    leaveChannel(channel, user)
+    console.log(user, 'disconnected')
   })
 })
 
