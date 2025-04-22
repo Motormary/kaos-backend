@@ -3,8 +3,6 @@ import express from 'express'
 import http from 'http'
 import { WebSocket, WebSocketServer } from 'ws'
 
-//todo: Add supabase - Connect user etc
-
 const app = express()
 const server = http.createServer(app)
 const wss = new WebSocketServer({ server })
